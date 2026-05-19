@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+npm-debug.log*
+data/raw/search_*.json
+data/raw/test_*.zip
+data/raw/test_*.csv
