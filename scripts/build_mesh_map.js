@@ -19,6 +19,8 @@ const PREF_REFERENCE_ZIPS = [
   path.join(RAW, "test_2015_19.zip"),
   path.join(RAW, "test_2020_19.zip"),
 ];
+const OSM_BUILDINGS_PATH = path.join(RAW, "osm_hokuto_buildings_overpass.json");
+const RESIDENTIAL_BUILDING_TAGS = new Set(["house", "residential", "apartments", "detached", "semidetached_house", "terrace"]);
 
 fs.mkdirSync(PROCESSED, { recursive: true });
 fs.mkdirSync(OUTPUT, { recursive: true });
@@ -147,6 +149,55 @@ function collectPrefKeys() {
   return keys;
 }
 
+function meshCodeFromPoint(lon, lat) {
+  const p = Math.floor(lat * 60 / 40);
+  const q = Math.floor(lon - 100);
+  const lat1 = lat - (p * 40) / 60;
+  const lon1 = lon - 100 - q;
+  const r = Math.floor(lat1 * 60 / 5);
+  const s = Math.floor(lon1 * 60 / 7.5);
+  const lat2 = lat1 - (r * 5) / 60;
+  const lon2 = lon1 - (s * 7.5) / 60;
+  const t = Math.floor(lat2 * 3600 / 30);
+  const u = Math.floor(lon2 * 3600 / 45);
+  return `${String(p).padStart(2, "0")}${String(q).padStart(2, "0")}${r}${s}${t}${u}`;
+}
+
+function aggregateOsmBuildings(hokutoGeometry) {
+  const byMesh = new Map();
+  const summary = { total: 0, inHokuto: 0, residentialTagged: 0, unknownTagged: 0 };
+  if (!fs.existsSync(OSM_BUILDINGS_PATH)) {
+    return { byMesh, summary };
+  }
+
+  const osm = JSON.parse(fs.readFileSync(OSM_BUILDINGS_PATH, "utf8"));
+  for (const element of osm.elements || []) {
+    const centerPoint = element.center ? [element.center.lon, element.center.lat] : null;
+    if (!centerPoint || !Number.isFinite(centerPoint[0]) || !Number.isFinite(centerPoint[1])) continue;
+    summary.total += 1;
+    if (!pointInGeometry(centerPoint, hokutoGeometry)) continue;
+    summary.inHokuto += 1;
+
+    const tag = element.tags?.building || "yes";
+    const meshCode = meshCodeFromPoint(centerPoint[0], centerPoint[1]);
+    if (!byMesh.has(meshCode)) {
+      byMesh.set(meshCode, { total: 0, residentialTagged: 0, unknownTagged: 0, tags: {} });
+    }
+    const stats = byMesh.get(meshCode);
+    stats.total += 1;
+    stats.tags[tag] = (stats.tags[tag] || 0) + 1;
+    if (RESIDENTIAL_BUILDING_TAGS.has(tag)) {
+      stats.residentialTagged += 1;
+      summary.residentialTagged += 1;
+    }
+    if (tag === "yes") {
+      stats.unknownTagged += 1;
+      summary.unknownTagged += 1;
+    }
+  }
+  return { byMesh, summary };
+}
+
 function buildData() {
   const yamanashiKeys = collectPrefKeys();
   const byMesh = new Map();
@@ -175,9 +226,17 @@ function buildData() {
 
   const hokuto = JSON.parse(fs.readFileSync(path.join(RAW, "hokuto_2020.geojson"), "utf8"));
   const hokutoGeometry = hokuto.features[0].geometry;
+  const osmBuildings = aggregateOsmBuildings(hokutoGeometry);
+
+  for (const meshCode of osmBuildings.byMesh.keys()) {
+    if (!byMesh.has(meshCode)) {
+      const bounds = meshBounds(meshCode);
+      byMesh.set(meshCode, { key: meshCode, bounds, areaKm2: meshAreaKm2(bounds), populations: {} });
+    }
+  }
 
   const features = [...byMesh.values()]
-    .filter((mesh) => YEARS.some((meta) => mesh.populations[meta.year] > 0))
+    .filter((mesh) => YEARS.some((meta) => mesh.populations[meta.year] > 0) || (osmBuildings.byMesh.get(mesh.key)?.total || 0) > 0)
     .sort((a, b) => a.key.localeCompare(b.key))
     .map((mesh) => {
       const densities = {};
@@ -194,6 +253,21 @@ function buildData() {
           population: mesh.populations,
           density_per_km2: densities,
           change_2010_2020: (mesh.populations[2020] ?? 0) - (mesh.populations[2010] ?? 0),
+          building_proxy: (() => {
+            const buildingStats = osmBuildings.byMesh.get(mesh.key) || { total: 0, residentialTagged: 0, unknownTagged: 0, tags: {} };
+            const pop2020 = mesh.populations[2020] ?? 0;
+            const peoplePerBuilding = buildingStats.total > 0 ? +(pop2020 / buildingStats.total).toFixed(2) : null;
+            const buildingsPer100People = pop2020 > 0 ? +((buildingStats.total / pop2020) * 100).toFixed(1) : (buildingStats.total > 0 ? null : 0);
+            return {
+              total_buildings: buildingStats.total,
+              residential_tagged_buildings: buildingStats.residentialTagged,
+              unknown_tagged_buildings: buildingStats.unknownTagged,
+              has_hokuto_buildings: buildingStats.total > 0,
+              people_per_building_2020: peoplePerBuilding,
+              buildings_per_100_people_2020: buildingsPer100People,
+              top_building_tags: Object.entries(buildingStats.tags).sort((a, b) => b[1] - a[1]).slice(0, 5),
+            };
+          })(),
         },
         geometry: { type: "Polygon", coordinates: meshPolygon(mesh.bounds) },
       };
@@ -210,7 +284,12 @@ function buildData() {
       sources: [
         "e-Stat 統計地理情報システム 地域メッシュ統計",
         "Geoshape 歴史的行政区域データセットβ版 / 国土数値情報 行政区域データ",
+        "OpenStreetMap building features via Overpass API",
       ],
+      building_proxy: {
+        definition: "OSM building centroids inside Hokuto city aggregated to 1km meshes. Vacation-home-likeness is approximated by low 2020 resident population per building.",
+        osm_summary: osmBuildings.summary,
+      },
     },
     features,
   };
@@ -280,9 +359,10 @@ function buildHtml(geojson) {
   <aside>
     <div class="control">
       <span class="label">表示モード</span>
-      <div class="segments two">
+      <div class="segments">
         <button id="modeDensity" class="active">人口密度</button>
         <button id="modeChange">増減</button>
+        <button id="modeVilla">別荘推定</button>
       </div>
     </div>
     <div class="control">
@@ -308,7 +388,7 @@ function buildHtml(geojson) {
       <span class="label">人口密度（人/km²）</span>
       <div id="legend" class="legend"></div>
     </div>
-    <p class="note">北杜市は2020年行政区域の境界にメッシュ中心点が含まれるものを抽出しています。境界付近のメッシュは市域外を一部含む場合があります。</p>
+    <p class="note">北杜市は2020年行政区域の境界にメッシュ中心点が含まれるものを抽出しています。別荘推定はOSM建物数と2020年人口からの近似で、実際の別荘戸数ではありません。</p>
   </aside>
   <section class="map-wrap">
     <div id="map" role="img" aria-label="山梨県と北杜市の1km人口密度メッシュマップ"></div>
@@ -332,6 +412,8 @@ const densityPalette = ["#fff7ec","#fee8c8","#fdd49e","#fdbb84","#fc8d59","#e34a
 const densityBreaks = [0, 25, 50, 100, 250, 500, 1000, Infinity];
 const changePalette = ["#2166ac","#67a9cf","#d1e5f0","#f7f7f7","#fddbc7","#ef8a62","#b2182b"];
 const changeBreaks = [-Infinity, -100, -50, -10, 10, 50, 100, Infinity];
+const villaPalette = ["#f7f7f7","#fee8c8","#fdbb84","#fc8d59","#e34a33","#b30000"];
+const villaScoreBreaks = [-Infinity, 0, 10, 25, 50, 100, Infinity];
 let meshLayer;
 let boundaryLayer;
 
@@ -361,6 +443,13 @@ function changeColorFor(value) {
   return changePalette[3];
 }
 
+function villaColorFor(score) {
+  for (let i = 0; i < villaScoreBreaks.length - 1; i++) {
+    if (score >= villaScoreBreaks[i] && score < villaScoreBreaks[i + 1]) return villaPalette[i];
+  }
+  return villaPalette[0];
+}
+
 function signed(value, unit) {
   const sign = value > 0 ? "+" : "";
   return sign + Number(value).toLocaleString("ja-JP") + unit;
@@ -382,11 +471,33 @@ function densityChange(f) {
   return featureDensity(f, changePair.to) - featureDensity(f, changePair.from);
 }
 
+function buildingProxy(f) {
+  return f.properties.building_proxy || {
+    total_buildings: 0,
+    residential_tagged_buildings: 0,
+    unknown_tagged_buildings: 0,
+    has_hokuto_buildings: false,
+    people_per_building_2020: null,
+    buildings_per_100_people_2020: 0,
+    top_building_tags: [],
+  };
+}
+
+function villaScore(f) {
+  const proxy = buildingProxy(f);
+  const pop = featurePopulation(f, 2020);
+  if (proxy.total_buildings <= 0) return 0;
+  if (pop <= 0) return 999;
+  return proxy.total_buildings / pop * 100;
+}
+
 function renderControls() {
   document.getElementById("modeDensity").classList.toggle("active", mode === "density");
   document.getElementById("modeChange").classList.toggle("active", mode === "change");
+  document.getElementById("modeVilla").classList.toggle("active", mode === "villa");
   document.getElementById("modeDensity").onclick = () => { mode = "density"; render(); };
   document.getElementById("modeChange").onclick = () => { mode = "change"; render(); };
+  document.getElementById("modeVilla").onclick = () => { mode = "villa"; render(); };
 
   document.getElementById("yearButtons").innerHTML = years.map(y => '<button class="' + (y === currentYear ? "active" : "") + '" data-year="' + y + '">' + y + '</button>').join("");
   document.querySelectorAll("[data-year]").forEach(btn => btn.addEventListener("click", () => {
@@ -412,7 +523,13 @@ function renderControls() {
 }
 
 function selectedFeatures() {
-  return geo.features.filter(f => scope === "yamanashi" || f.properties.is_hokuto);
+  return geo.features.filter(inCurrentScope);
+}
+
+function inCurrentScope(f) {
+  if (scope === "yamanashi") return true;
+  if (f.properties.is_hokuto) return true;
+  return mode === "villa" && buildingProxy(f).has_hokuto_buildings;
 }
 
 function geoJsonBounds(features) {
@@ -433,6 +550,21 @@ function renderStats(features) {
     return;
   }
 
+  if (mode === "villa") {
+    const buildingMeshes = features.filter(f => buildingProxy(f).total_buildings > 0);
+    const totalBuildings = features.reduce((sum, f) => sum + buildingProxy(f).total_buildings, 0);
+    const residentialTagged = features.reduce((sum, f) => sum + buildingProxy(f).residential_tagged_buildings, 0);
+    const pop = features.reduce((sum, f) => sum + featurePopulation(f, 2020), 0);
+    const peoplePerBuilding = totalBuildings > 0 ? pop / totalBuildings : 0;
+    document.getElementById("stats").innerHTML = [
+      ["建物ありメッシュ", buildingMeshes.length.toLocaleString("ja-JP")],
+      ["OSM建物数", totalBuildings.toLocaleString("ja-JP")],
+      ["住宅系タグ数", residentialTagged.toLocaleString("ja-JP")],
+      ["人口/建物", peoplePerBuilding.toFixed(2).toLocaleString("ja-JP") + " 人/棟"],
+    ].map(([k, v]) => '<div class="stat"><span>' + k + '</span><strong>' + v + '</strong></div>').join("");
+    return;
+  }
+
   const fromPop = features.reduce((sum, f) => sum + featurePopulation(f, changePair.from), 0);
   const toPop = features.reduce((sum, f) => sum + featurePopulation(f, changePair.to), 0);
   const changed = features.filter(f => populationChange(f) !== 0).length;
@@ -448,15 +580,36 @@ function renderStats(features) {
 function renderLegend() {
   const labels = mode === "density"
     ? ["0-25", "25-50", "50-100", "100-250", "250-500", "500-1,000", "1,000+"]
-    : ["-100以下", "-100 - -50", "-50 - -10", "-10 - +10", "+10 - +50", "+50 - +100", "+100以上"];
-  const palette = mode === "density" ? densityPalette : changePalette;
+    : mode === "change"
+      ? ["-100以下", "-100 - -50", "-50 - -10", "-10 - +10", "+10 - +50", "+50 - +100", "+100以上"]
+      : ["建物なし", "0-10", "10-25", "25-50", "50-100", "100+"];
+  const palette = mode === "density" ? densityPalette : mode === "change" ? changePalette : villaPalette;
   document.querySelector(".control .label + #legend");
-  document.getElementById("legend").previousElementSibling.textContent = mode === "density" ? "人口密度（人/km²）" : "人口増減（人）";
+  document.getElementById("legend").previousElementSibling.textContent =
+    mode === "density" ? "人口密度（人/km²）" : mode === "change" ? "人口増減（人）" : "建物数/100人";
   document.getElementById("legend").innerHTML = labels.map((label, i) => '<div class="swatch"><span class="chip" style="background:' + palette[i] + '"></span><span>' + label + '</span></div>').join("");
 }
 
 function popupHtml(f) {
   const p = f.properties;
+  if (mode === "villa") {
+    const proxy = buildingProxy(f);
+    const pop = featurePopulation(f, 2020);
+    const score = villaScore(f);
+    const peoplePerBuilding = proxy.people_per_building_2020 === null ? "人口0または建物なし" : Number(proxy.people_per_building_2020).toLocaleString("ja-JP") + " 人/棟";
+    const tagSummary = proxy.top_building_tags.length
+      ? proxy.top_building_tags.map(([tag, count]) => tag + ":" + count).join(", ")
+      : "なし";
+    return '<div class="mesh-popup"><b>メッシュ ' + p.mesh_code + '</b><br>' +
+      (p.is_hokuto ? '北杜市内' : '山梨県内') + '<br>' +
+      '2020年人口: ' + Math.round(pop).toLocaleString("ja-JP") + ' 人<br>' +
+      'OSM建物数: ' + proxy.total_buildings.toLocaleString("ja-JP") + ' 棟<br>' +
+      '住宅系タグ数: ' + proxy.residential_tagged_buildings.toLocaleString("ja-JP") + ' 棟<br>' +
+      '人口/建物: ' + peoplePerBuilding + '<br>' +
+      '建物数/100人: ' + (score >= 999 ? '人口0で建物あり' : score.toFixed(1).toLocaleString("ja-JP")) + '<br>' +
+      '主なbuildingタグ: ' + tagSummary + '</div>';
+  }
+
   if (mode === "change") {
     const fromPop = featurePopulation(f, changePair.from);
     const toPop = featurePopulation(f, changePair.to);
@@ -480,14 +633,15 @@ function popupHtml(f) {
 }
 
 function styleForFeature(f) {
-  const value = mode === "density" ? featureDensity(f, currentYear) : populationChange(f);
-  const dim = scope === "hokuto" && !f.properties.is_hokuto;
+  const value = mode === "density" ? featureDensity(f, currentYear) : mode === "change" ? populationChange(f) : villaScore(f);
+  const dim = !inCurrentScope(f);
+  const noVillaData = mode === "villa" && buildingProxy(f).total_buildings <= 0;
   return {
     color: "rgba(32,45,60,.45)",
-    weight: dim ? 0.2 : 0.6,
-    opacity: dim ? 0.18 : 0.85,
-    fillColor: mode === "density" ? colorFor(value) : changeColorFor(value),
-    fillOpacity: dim ? 0.08 : 0.68,
+    weight: dim || noVillaData ? 0.2 : 0.6,
+    opacity: dim || noVillaData ? 0.18 : 0.85,
+    fillColor: mode === "density" ? colorFor(value) : mode === "change" ? changeColorFor(value) : villaColorFor(value),
+    fillOpacity: dim ? 0.08 : noVillaData ? 0.12 : 0.68,
   };
 }
 
