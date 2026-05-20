@@ -398,8 +398,8 @@ function buildHtml(geojson) {
     <div class="control">
       <span class="label">メッシュ数値</span>
       <div class="toggle">
-        <button id="labelsOn" class="active">表示</button>
-        <button id="labelsOff">非表示</button>
+        <button id="labelsOn">表示</button>
+        <button id="labelsOff" class="active">非表示</button>
       </div>
     </div>
     <div class="control">
@@ -430,7 +430,7 @@ let currentYear = 2020;
 let mode = "density";
 let changePair = changePairs[0];
 let scope = "hokuto";
-let showLabels = true;
+let showLabels = false;
 const densityPalette = ["#fff7ec","#fee8c8","#fdd49e","#fdbb84","#fc8d59","#e34a33","#b30000"];
 const densityBreaks = [0, 25, 50, 100, 250, 500, 1000, Infinity];
 const changePalette = ["#2166ac","#67a9cf","#d1e5f0","#f7f7f7","#fddbc7","#ef8a62","#b2182b"];
