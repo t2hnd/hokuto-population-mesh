@@ -342,6 +342,21 @@ function buildHtml(geojson) {
     .leaflet-control-zoom a { color: var(--ink); }
     .mesh-popup { min-width: 210px; font-size: 12px; line-height: 1.45; }
     .mesh-popup b { font-size: 13px; }
+    .mesh-label-icon { background: transparent; border: 0; }
+    .mesh-label {
+      display: block;
+      min-width: 34px;
+      text-align: center;
+      color: rgba(17, 24, 39, .48);
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1;
+      text-shadow: 0 1px 2px rgba(255,255,255,.95), 0 -1px 2px rgba(255,255,255,.85), 1px 0 2px rgba(255,255,255,.85), -1px 0 2px rgba(255,255,255,.85);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      user-select: none;
+      white-space: nowrap;
+    }
     .leaflet-interactive { outline: none; }
     @media (max-width: 780px) {
       main { grid-template-columns: 1fr; }
@@ -381,6 +396,13 @@ function buildHtml(geojson) {
       </div>
     </div>
     <div class="control">
+      <span class="label">メッシュ数値</span>
+      <div class="toggle">
+        <button id="labelsOn" class="active">表示</button>
+        <button id="labelsOff">非表示</button>
+      </div>
+    </div>
+    <div class="control">
       <span class="label">表示中の概要</span>
       <div id="stats"></div>
     </div>
@@ -408,6 +430,7 @@ let currentYear = 2020;
 let mode = "density";
 let changePair = changePairs[0];
 let scope = "hokuto";
+let showLabels = true;
 const densityPalette = ["#fff7ec","#fee8c8","#fdd49e","#fdbb84","#fc8d59","#e34a33","#b30000"];
 const densityBreaks = [0, 25, 50, 100, 250, 500, 1000, Infinity];
 const changePalette = ["#2166ac","#67a9cf","#d1e5f0","#f7f7f7","#fddbc7","#ef8a62","#b2182b"];
@@ -416,6 +439,7 @@ const villaPalette = ["#f7f7f7","#fee8c8","#fdbb84","#fc8d59","#e34a33","#b30000
 const villaScoreBreaks = [-Infinity, 0, 10, 25, 50, 100, Infinity];
 let meshLayer;
 let boundaryLayer;
+let labelLayer;
 
 const map = L.map("map", {
   zoomControl: true,
@@ -520,6 +544,8 @@ function renderControls() {
 
   document.getElementById("scopeYamanashi").onclick = () => { scope = "yamanashi"; render(); };
   document.getElementById("scopeHokuto").onclick = () => { scope = "hokuto"; render(); };
+  document.getElementById("labelsOn").onclick = () => { showLabels = true; render(); };
+  document.getElementById("labelsOff").onclick = () => { showLabels = false; render(); };
 }
 
 function selectedFeatures() {
@@ -632,6 +658,29 @@ function popupHtml(f) {
     '2010→2020増減: ' + (p.change_2010_2020 >= 0 ? '+' : '') + p.change_2010_2020.toLocaleString("ja-JP") + ' 人</div>';
 }
 
+function meshCenterLatLng(f) {
+  const ring = f.geometry.coordinates[0];
+  const lngs = ring.map(([lng]) => lng);
+  const lats = ring.map(([, lat]) => lat);
+  return [
+    (Math.min(...lats) + Math.max(...lats)) / 2,
+    (Math.min(...lngs) + Math.max(...lngs)) / 2,
+  ];
+}
+
+function labelText(f) {
+  if (mode === "density") {
+    const value = featureDensity(f, currentYear);
+    return value >= 100 ? Math.round(value).toLocaleString("ja-JP") : value.toFixed(1);
+  }
+  if (mode === "change") {
+    return signed(Math.round(populationChange(f)), "");
+  }
+  const score = villaScore(f);
+  if (score >= 999) return "∞";
+  return score >= 100 ? Math.round(score).toLocaleString("ja-JP") : score.toFixed(1);
+}
+
 function styleForFeature(f) {
   const value = mode === "density" ? featureDensity(f, currentYear) : mode === "change" ? populationChange(f) : villaScore(f);
   const dim = !inCurrentScope(f);
@@ -648,6 +697,7 @@ function styleForFeature(f) {
 function renderMapLayer(features) {
   if (meshLayer) meshLayer.remove();
   if (boundaryLayer) boundaryLayer.remove();
+  if (labelLayer) labelLayer.remove();
 
   meshLayer = L.geoJSON(geo, {
     style: styleForFeature,
@@ -663,6 +713,23 @@ function renderMapLayer(features) {
     interactive: false,
   }).addTo(map);
 
+  labelLayer = L.layerGroup();
+  if (showLabels) {
+    features.forEach((feature) => {
+      const text = labelText(feature);
+      L.marker(meshCenterLatLng(feature), {
+        interactive: false,
+        keyboard: false,
+        icon: L.divIcon({
+          className: "mesh-label-icon",
+          html: '<span class="mesh-label">' + text + '</span>',
+          iconSize: [0, 0],
+        }),
+      }).addTo(labelLayer);
+    });
+  }
+  labelLayer.addTo(map);
+
   const bounds = scope === "hokuto" ? boundaryLayer.getBounds() : geoJsonBounds(features);
   if (bounds.isValid()) map.fitBounds(bounds.pad(0.05), { animate: false });
 }
@@ -671,6 +738,8 @@ function render() {
   renderControls();
   document.getElementById("scopeYamanashi").classList.toggle("active", scope === "yamanashi");
   document.getElementById("scopeHokuto").classList.toggle("active", scope === "hokuto");
+  document.getElementById("labelsOn").classList.toggle("active", showLabels);
+  document.getElementById("labelsOff").classList.toggle("active", !showLabels);
   const features = selectedFeatures();
   renderStats(features);
   renderLegend();
