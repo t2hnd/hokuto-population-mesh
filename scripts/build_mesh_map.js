@@ -9,9 +9,9 @@ const OUTPUT = path.join(ROOT, "output");
 const DIST = path.join(ROOT, "dist");
 
 const YEARS = [
-  { year: 2010, stat: "T000608", column: "T000608001", source: "平成22年国勢調査 3次メッシュ 男女別人口総数及び世帯総数" },
-  { year: 2015, stat: "T000846", column: "T000846001", source: "平成27年国勢調査 3次メッシュ 人口等基本集計に関する事項" },
-  { year: 2020, stat: "T001100", column: "T001100001", source: "令和2年国勢調査 3次メッシュ 人口及び世帯" },
+  { year: 2010, stat: "T000608", populationColumn: "T000608001", householdColumn: "T000608004", source: "平成22年国勢調査 3次メッシュ 男女別人口総数及び世帯総数" },
+  { year: 2015, stat: "T000846", populationColumn: "T000846001", householdColumn: "T000846025", source: "平成27年国勢調査 3次メッシュ 人口等基本集計に関する事項" },
+  { year: 2020, stat: "T001100", populationColumn: "T001100001", householdColumn: "T001100034", source: "令和2年国勢調査 3次メッシュ 人口及び世帯" },
 ];
 
 const PRIMARY_CODES = ["5238", "5338", "5339"];
@@ -54,22 +54,27 @@ function parseCsvLine(line) {
   return out;
 }
 
-function readPopulation(zipPath, popColumn) {
+function readMeshStats(zipPath, populationColumn, householdColumn) {
   const text = unzipText(zipPath).replace(/\r/g, "");
   const lines = text.split("\n").filter(Boolean);
   const header = parseCsvLine(lines[0]);
   const keyIndex = header.indexOf("KEY_CODE");
-  const popIndex = header.indexOf(popColumn);
-  if (keyIndex === -1 || popIndex === -1) {
+  const populationIndex = header.indexOf(populationColumn);
+  const householdIndex = header.indexOf(householdColumn);
+  if (keyIndex === -1 || populationIndex === -1 || householdIndex === -1) {
     throw new Error(`Required columns not found in ${zipPath}`);
   }
   const rows = new Map();
   for (const line of lines.slice(2)) {
     const cols = parseCsvLine(line);
     const key = cols[keyIndex];
-    const pop = Number(cols[popIndex]);
-    if (/^\d{8}$/.test(key) && Number.isFinite(pop)) {
-      rows.set(key, pop);
+    const population = Number(cols[populationIndex]);
+    const households = Number(cols[householdIndex]);
+    if (/^\d{8}$/.test(key) && Number.isFinite(population)) {
+      rows.set(key, {
+        population,
+        households: Number.isFinite(households) ? households : 0,
+      });
     }
   }
   return rows;
@@ -206,21 +211,22 @@ function buildData() {
     const rows = new Map();
     const prefZip = path.join(RAW, `test_${meta.year}_19.zip`);
     if (fs.existsSync(prefZip) && meta.year !== 2010) {
-      for (const [key, pop] of readPopulation(prefZip, meta.column)) rows.set(key, pop);
+      for (const [key, stats] of readMeshStats(prefZip, meta.populationColumn, meta.householdColumn)) rows.set(key, stats);
     } else {
       for (const primary of PRIMARY_CODES) {
         const zip = path.join(RAW, `pop_${meta.year}_${primary}.zip`);
-        for (const [key, pop] of readPopulation(zip, meta.column)) {
-          if (yamanashiKeys.has(key)) rows.set(key, pop);
+        for (const [key, stats] of readMeshStats(zip, meta.populationColumn, meta.householdColumn)) {
+          if (yamanashiKeys.has(key)) rows.set(key, stats);
         }
       }
     }
-    for (const [key, pop] of rows) {
+    for (const [key, stats] of rows) {
       if (!byMesh.has(key)) {
         const bounds = meshBounds(key);
-        byMesh.set(key, { key, bounds, areaKm2: meshAreaKm2(bounds), populations: {} });
+        byMesh.set(key, { key, bounds, areaKm2: meshAreaKm2(bounds), populations: {}, households: {} });
       }
-      byMesh.get(key).populations[meta.year] = pop;
+      byMesh.get(key).populations[meta.year] = stats.population;
+      byMesh.get(key).households[meta.year] = stats.households;
     }
   }
 
@@ -231,7 +237,7 @@ function buildData() {
   for (const meshCode of osmBuildings.byMesh.keys()) {
     if (!byMesh.has(meshCode)) {
       const bounds = meshBounds(meshCode);
-      byMesh.set(meshCode, { key: meshCode, bounds, areaKm2: meshAreaKm2(bounds), populations: {} });
+      byMesh.set(meshCode, { key: meshCode, bounds, areaKm2: meshAreaKm2(bounds), populations: {}, households: {} });
     }
   }
 
@@ -251,8 +257,10 @@ function buildData() {
           area_km2: +mesh.areaKm2.toFixed(4),
           is_hokuto: pointInGeometry(center(mesh.bounds), hokutoGeometry),
           population: mesh.populations,
+          households: mesh.households,
           density_per_km2: densities,
           change_2010_2020: (mesh.populations[2020] ?? 0) - (mesh.populations[2010] ?? 0),
+          household_change_2010_2020: (mesh.households[2020] ?? 0) - (mesh.households[2010] ?? 0),
           building_proxy: (() => {
             const buildingStats = osmBuildings.byMesh.get(mesh.key) || { total: 0, residentialTagged: 0, unknownTagged: 0, tags: {} };
             const pop2020 = mesh.populations[2020] ?? 0;
@@ -325,6 +333,7 @@ function buildHtml(geojson) {
     .control { margin-bottom: 18px; }
     .label { display: block; margin-bottom: 8px; font-weight: 700; font-size: 13px; }
     .segments { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .segments.modes { grid-template-columns: repeat(2, 1fr); }
     .segments.two { grid-template-columns: repeat(2, 1fr); }
     .segments.pairs { grid-template-columns: 1fr; }
     button { border: 1px solid var(--line); background: #fff; color: var(--ink); min-height: 36px; border-radius: 6px; font-weight: 700; cursor: pointer; }
@@ -374,9 +383,11 @@ function buildHtml(geojson) {
   <aside>
     <div class="control">
       <span class="label">表示モード</span>
-      <div class="segments">
+      <div class="segments modes">
         <button id="modeDensity" class="active">人口密度</button>
         <button id="modeChange">増減</button>
+        <button id="modeHouseholds">世帯数</button>
+        <button id="modeHouseholdChange">世帯増減</button>
         <button id="modeVilla">別荘推定</button>
       </div>
     </div>
@@ -433,8 +444,11 @@ let scope = "hokuto";
 let showLabels = false;
 const densityPalette = ["#fff7ec","#fee8c8","#fdd49e","#fdbb84","#fc8d59","#e34a33","#b30000"];
 const densityBreaks = [0, 25, 50, 100, 250, 500, 1000, Infinity];
+const householdPalette = ["#f7fcf5","#e5f5e0","#c7e9c0","#a1d99b","#74c476","#31a354","#006d2c"];
+const householdBreaks = [0, 10, 25, 50, 100, 250, 500, Infinity];
 const changePalette = ["#2166ac","#67a9cf","#d1e5f0","#f7f7f7","#fddbc7","#ef8a62","#b2182b"];
 const changeBreaks = [-Infinity, -100, -50, -10, 10, 50, 100, Infinity];
+const householdChangeBreaks = [-Infinity, -50, -25, -10, 10, 25, 50, Infinity];
 const villaPalette = ["#f7f7f7","#fee8c8","#fdbb84","#fc8d59","#e34a33","#b30000"];
 const villaScoreBreaks = [-Infinity, 0, 10, 25, 50, 100, Infinity];
 let meshLayer;
@@ -460,9 +474,17 @@ function colorFor(value) {
   return densityPalette[0];
 }
 
+function householdColorFor(value) {
+  for (let i = 0; i < householdBreaks.length - 1; i++) {
+    if (value >= householdBreaks[i] && value < householdBreaks[i + 1]) return householdPalette[i];
+  }
+  return householdPalette[0];
+}
+
 function changeColorFor(value) {
-  for (let i = 0; i < changeBreaks.length - 1; i++) {
-    if (value >= changeBreaks[i] && value < changeBreaks[i + 1]) return changePalette[i];
+  const breaks = mode === "householdChange" ? householdChangeBreaks : changeBreaks;
+  for (let i = 0; i < breaks.length - 1; i++) {
+    if (value >= breaks[i] && value < breaks[i + 1]) return changePalette[i];
   }
   return changePalette[3];
 }
@@ -483,12 +505,20 @@ function featurePopulation(f, year) {
   return f.properties.population[year] || 0;
 }
 
+function featureHouseholds(f, year) {
+  return f.properties.households[year] || 0;
+}
+
 function featureDensity(f, year) {
   return f.properties.density_per_km2[year] || 0;
 }
 
 function populationChange(f) {
   return featurePopulation(f, changePair.to) - featurePopulation(f, changePair.from);
+}
+
+function householdChange(f) {
+  return featureHouseholds(f, changePair.to) - featureHouseholds(f, changePair.from);
 }
 
 function densityChange(f) {
@@ -518,18 +548,22 @@ function villaScore(f) {
 function renderControls() {
   document.getElementById("modeDensity").classList.toggle("active", mode === "density");
   document.getElementById("modeChange").classList.toggle("active", mode === "change");
+  document.getElementById("modeHouseholds").classList.toggle("active", mode === "households");
+  document.getElementById("modeHouseholdChange").classList.toggle("active", mode === "householdChange");
   document.getElementById("modeVilla").classList.toggle("active", mode === "villa");
   document.getElementById("modeDensity").onclick = () => { mode = "density"; render(); };
   document.getElementById("modeChange").onclick = () => { mode = "change"; render(); };
+  document.getElementById("modeHouseholds").onclick = () => { mode = "households"; render(); };
+  document.getElementById("modeHouseholdChange").onclick = () => { mode = "householdChange"; render(); };
   document.getElementById("modeVilla").onclick = () => { mode = "villa"; render(); };
 
   document.getElementById("yearButtons").innerHTML = years.map(y => '<button class="' + (y === currentYear ? "active" : "") + '" data-year="' + y + '">' + y + '</button>').join("");
   document.querySelectorAll("[data-year]").forEach(btn => btn.addEventListener("click", () => {
     currentYear = Number(btn.dataset.year);
-    mode = "density";
+    if (mode !== "households") mode = "density";
     render();
   }));
-  document.getElementById("yearButtons").parentElement.style.display = mode === "density" ? "" : "none";
+  document.getElementById("yearButtons").parentElement.style.display = mode === "density" || mode === "households" ? "" : "none";
 
   document.getElementById("changeButtons").innerHTML = changePairs.map(pair => {
     const active = pair.from === changePair.from && pair.to === changePair.to;
@@ -537,10 +571,10 @@ function renderControls() {
   }).join("");
   document.querySelectorAll("[data-from]").forEach(btn => btn.addEventListener("click", () => {
     changePair = { from: Number(btn.dataset.from), to: Number(btn.dataset.to) };
-    mode = "change";
+    if (mode !== "householdChange") mode = "change";
     render();
   }));
-  document.getElementById("changeControl").style.display = mode === "change" ? "" : "none";
+  document.getElementById("changeControl").style.display = mode === "change" || mode === "householdChange" ? "" : "none";
 
   document.getElementById("scopeYamanashi").onclick = () => { scope = "yamanashi"; render(); };
   document.getElementById("scopeHokuto").onclick = () => { scope = "hokuto"; render(); };
@@ -576,6 +610,18 @@ function renderStats(features) {
     return;
   }
 
+  if (mode === "households") {
+    const households = features.reduce((sum, f) => sum + featureHouseholds(f, currentYear), 0);
+    const density = households / area;
+    const nonzero = features.filter(f => featureHouseholds(f, currentYear) > 0).length;
+    document.getElementById("stats").innerHTML = [
+      ["メッシュ数", nonzero.toLocaleString("ja-JP")],
+      ["世帯数合計", Math.round(households).toLocaleString("ja-JP") + " 世帯"],
+      ["平均世帯密度", density.toFixed(1).toLocaleString("ja-JP") + " 世帯/km²"],
+    ].map(([k, v]) => '<div class="stat"><span>' + k + '</span><strong>' + v + '</strong></div>').join("");
+    return;
+  }
+
   if (mode === "villa") {
     const buildingMeshes = features.filter(f => buildingProxy(f).total_buildings > 0);
     const totalBuildings = features.reduce((sum, f) => sum + buildingProxy(f).total_buildings, 0);
@@ -591,14 +637,17 @@ function renderStats(features) {
     return;
   }
 
-  const fromPop = features.reduce((sum, f) => sum + featurePopulation(f, changePair.from), 0);
-  const toPop = features.reduce((sum, f) => sum + featurePopulation(f, changePair.to), 0);
-  const changed = features.filter(f => populationChange(f) !== 0).length;
-  const densityDelta = (toPop - fromPop) / area;
+  const isHouseholdChange = mode === "householdChange";
+  const fromValue = features.reduce((sum, f) => sum + (isHouseholdChange ? featureHouseholds(f, changePair.from) : featurePopulation(f, changePair.from)), 0);
+  const toValue = features.reduce((sum, f) => sum + (isHouseholdChange ? featureHouseholds(f, changePair.to) : featurePopulation(f, changePair.to)), 0);
+  const changed = features.filter(f => (isHouseholdChange ? householdChange(f) : populationChange(f)) !== 0).length;
+  const densityDelta = (toValue - fromValue) / area;
+  const unit = isHouseholdChange ? " 世帯" : " 人";
+  const densityUnit = isHouseholdChange ? " 世帯/km²" : " 人/km²";
   document.getElementById("stats").innerHTML = [
     ["比較期間", changePair.from + " → " + changePair.to],
-    ["人口増減", signed(Math.round(toPop - fromPop), " 人")],
-    ["平均密度差", signed(densityDelta.toFixed(1), " 人/km²")],
+    [isHouseholdChange ? "世帯増減" : "人口増減", signed(Math.round(toValue - fromValue), unit)],
+    ["平均密度差", signed(densityDelta.toFixed(1), densityUnit)],
     ["変化ありメッシュ", changed.toLocaleString("ja-JP")],
   ].map(([k, v]) => '<div class="stat"><span>' + k + '</span><strong>' + v + '</strong></div>').join("");
 }
@@ -606,13 +655,17 @@ function renderStats(features) {
 function renderLegend() {
   const labels = mode === "density"
     ? ["0-25", "25-50", "50-100", "100-250", "250-500", "500-1,000", "1,000+"]
+    : mode === "households"
+      ? ["0-10", "10-25", "25-50", "50-100", "100-250", "250-500", "500+"]
     : mode === "change"
       ? ["-100以下", "-100 - -50", "-50 - -10", "-10 - +10", "+10 - +50", "+50 - +100", "+100以上"]
+    : mode === "householdChange"
+      ? ["-50以下", "-50 - -25", "-25 - -10", "-10 - +10", "+10 - +25", "+25 - +50", "+50以上"]
       : ["建物なし", "0-10", "10-25", "25-50", "50-100", "100+"];
-  const palette = mode === "density" ? densityPalette : mode === "change" ? changePalette : villaPalette;
+  const palette = mode === "density" ? densityPalette : mode === "households" ? householdPalette : mode === "change" || mode === "householdChange" ? changePalette : villaPalette;
   document.querySelector(".control .label + #legend");
   document.getElementById("legend").previousElementSibling.textContent =
-    mode === "density" ? "人口密度（人/km²）" : mode === "change" ? "人口増減（人）" : "建物数/100人";
+    mode === "density" ? "人口密度（人/km²）" : mode === "households" ? "世帯数（世帯/メッシュ）" : mode === "change" ? "人口増減（人）" : mode === "householdChange" ? "世帯増減（世帯）" : "建物数/100人";
   document.getElementById("legend").innerHTML = labels.map((label, i) => '<div class="swatch"><span class="chip" style="background:' + palette[i] + '"></span><span>' + label + '</span></div>').join("");
 }
 
@@ -649,6 +702,30 @@ function popupHtml(f) {
       '密度差: ' + signed(denDiff.toFixed(1), ' 人/km²') + '</div>';
   }
 
+  if (mode === "householdChange") {
+    const fromHouseholds = featureHouseholds(f, changePair.from);
+    const toHouseholds = featureHouseholds(f, changePair.to);
+    const diff = toHouseholds - fromHouseholds;
+    return '<div class="mesh-popup"><b>メッシュ ' + p.mesh_code + '</b><br>' +
+      (p.is_hokuto ? '北杜市内' : '山梨県内') + '<br>' +
+      changePair.from + '年世帯数: ' + Math.round(fromHouseholds).toLocaleString("ja-JP") + ' 世帯<br>' +
+      changePair.to + '年世帯数: ' + Math.round(toHouseholds).toLocaleString("ja-JP") + ' 世帯<br>' +
+      '世帯増減: ' + signed(Math.round(diff), ' 世帯') + '<br>' +
+      '人口増減: ' + signed(Math.round(populationChange(f)), ' 人') + '</div>';
+  }
+
+  if (mode === "households") {
+    const households = featureHouseholds(f, currentYear);
+    const pop = featurePopulation(f, currentYear);
+    const peoplePerHousehold = households > 0 ? pop / households : 0;
+    return '<div class="mesh-popup"><b>メッシュ ' + p.mesh_code + '</b><br>' +
+      (p.is_hokuto ? '北杜市内' : '山梨県内') + '<br>' +
+      currentYear + '年世帯数: ' + Math.round(households).toLocaleString("ja-JP") + ' 世帯<br>' +
+      currentYear + '年人口: ' + Math.round(pop).toLocaleString("ja-JP") + ' 人<br>' +
+      '1世帯あたり人口: ' + peoplePerHousehold.toFixed(2).toLocaleString("ja-JP") + ' 人/世帯<br>' +
+      '2010→2020世帯増減: ' + signed(p.household_change_2010_2020 || 0, ' 世帯') + '</div>';
+  }
+
   const pop = p.population[currentYear] ?? 0;
   const den = p.density_per_km2[currentYear] ?? 0;
   return '<div class="mesh-popup"><b>メッシュ ' + p.mesh_code + '</b><br>' +
@@ -673,8 +750,14 @@ function labelText(f) {
     const value = featureDensity(f, currentYear);
     return value >= 100 ? Math.round(value).toLocaleString("ja-JP") : value.toFixed(1);
   }
+  if (mode === "households") {
+    return Math.round(featureHouseholds(f, currentYear)).toLocaleString("ja-JP");
+  }
   if (mode === "change") {
     return signed(Math.round(populationChange(f)), "");
+  }
+  if (mode === "householdChange") {
+    return signed(Math.round(householdChange(f)), "");
   }
   const score = villaScore(f);
   if (score >= 999) return "∞";
@@ -682,14 +765,14 @@ function labelText(f) {
 }
 
 function styleForFeature(f) {
-  const value = mode === "density" ? featureDensity(f, currentYear) : mode === "change" ? populationChange(f) : villaScore(f);
+  const value = mode === "density" ? featureDensity(f, currentYear) : mode === "households" ? featureHouseholds(f, currentYear) : mode === "change" ? populationChange(f) : mode === "householdChange" ? householdChange(f) : villaScore(f);
   const dim = !inCurrentScope(f);
   const noVillaData = mode === "villa" && buildingProxy(f).total_buildings <= 0;
   return {
     color: "rgba(32,45,60,.45)",
     weight: dim || noVillaData ? 0.2 : 0.6,
     opacity: dim || noVillaData ? 0.18 : 0.85,
-    fillColor: mode === "density" ? colorFor(value) : mode === "change" ? changeColorFor(value) : villaColorFor(value),
+    fillColor: mode === "density" ? colorFor(value) : mode === "households" ? householdColorFor(value) : mode === "change" || mode === "householdChange" ? changeColorFor(value) : villaColorFor(value),
     fillOpacity: dim ? 0.08 : noVillaData ? 0.12 : 0.68,
   };
 }
