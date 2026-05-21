@@ -21,6 +21,33 @@ const PREF_REFERENCE_ZIPS = [
 ];
 const OSM_BUILDINGS_PATH = path.join(RAW, "osm_hokuto_buildings_overpass.json");
 const RESIDENTIAL_BUILDING_TAGS = new Set(["house", "residential", "apartments", "detached", "semidetached_house", "terrace"]);
+const NON_RESIDENTIAL_BUILDING_TAGS = new Set([
+  "industrial",
+  "agricultural",
+  "greenhouse",
+  "public",
+  "retail",
+  "warehouse",
+  "roof",
+  "hotel",
+  "commercial",
+  "school",
+  "hut",
+  "garage",
+  "government",
+  "train_station",
+  "office",
+  "supermarket",
+  "cowshed",
+  "fire_station",
+  "parking",
+  "farm_auxiliary",
+  "amenity",
+  "kindergarten",
+  "hospital",
+  "temple",
+  "sports_centre",
+]);
 
 fs.mkdirSync(PROCESSED, { recursive: true });
 fs.mkdirSync(OUTPUT, { recursive: true });
@@ -264,15 +291,41 @@ function buildData() {
           building_proxy: (() => {
             const buildingStats = osmBuildings.byMesh.get(mesh.key) || { total: 0, residentialTagged: 0, unknownTagged: 0, tags: {} };
             const pop2020 = mesh.populations[2020] ?? 0;
+            const households2020 = mesh.households[2020] ?? 0;
+            const nonResidentialTagged = Object.entries(buildingStats.tags)
+              .filter(([tag]) => NON_RESIDENTIAL_BUILDING_TAGS.has(tag))
+              .reduce((sum, [, count]) => sum + count, 0);
+            const candidateBuildings = Math.max(0, buildingStats.total - nonResidentialTagged);
+            const surplusBuildings = Math.max(0, candidateBuildings - households2020);
             const peoplePerBuilding = buildingStats.total > 0 ? +(pop2020 / buildingStats.total).toFixed(2) : null;
             const buildingsPer100People = pop2020 > 0 ? +((buildingStats.total / pop2020) * 100).toFixed(1) : (buildingStats.total > 0 ? null : 0);
+            const buildingsPerHousehold = households2020 > 0 ? +(candidateBuildings / households2020).toFixed(2) : null;
+            const rawVillaScore = households2020 > 0
+              ? +((surplusBuildings / households2020) * 100).toFixed(1)
+              : (candidateBuildings >= 5 ? 100 : 0);
+            const confidence = candidateBuildings < 5
+              ? "low"
+              : buildingStats.residentialTagged >= 5
+                ? "high"
+                : buildingStats.unknownTagged / Math.max(candidateBuildings, 1) > 0.8
+                  ? "low"
+                  : "medium";
+            const confidenceWeight = confidence === "high" ? 1 : confidence === "medium" ? 0.65 : 0.25;
+            const villaScore = +(rawVillaScore * confidenceWeight).toFixed(1);
             return {
               total_buildings: buildingStats.total,
+              candidate_buildings: candidateBuildings,
               residential_tagged_buildings: buildingStats.residentialTagged,
+              non_residential_tagged_buildings: nonResidentialTagged,
               unknown_tagged_buildings: buildingStats.unknownTagged,
               has_hokuto_buildings: buildingStats.total > 0,
               people_per_building_2020: peoplePerBuilding,
               buildings_per_100_people_2020: buildingsPer100People,
+              buildings_per_household_2020: buildingsPerHousehold,
+              surplus_buildings_vs_households_2020: surplusBuildings,
+              raw_villa_score_2020: rawVillaScore,
+              villa_score_2020: villaScore,
+              villa_confidence: confidence,
               top_building_tags: Object.entries(buildingStats.tags).sort((a, b) => b[1] - a[1]).slice(0, 5),
             };
           })(),
@@ -295,7 +348,7 @@ function buildData() {
         "OpenStreetMap building features via Overpass API",
       ],
       building_proxy: {
-        definition: "OSM building centroids inside Hokuto city aggregated to 1km meshes. Vacation-home-likeness is approximated by low 2020 resident population per building.",
+        definition: "OSM building centroids inside Hokuto city aggregated to 1km meshes. Vacation-home-likeness is approximated by candidate buildings exceeding 2020 census households after excluding clearly non-residential OSM building tags.",
         osm_summary: osmBuildings.summary,
       },
     },
@@ -421,7 +474,7 @@ function buildHtml(geojson) {
       <span class="label">人口密度（人/km²）</span>
       <div id="legend" class="legend"></div>
     </div>
-    <p class="note">北杜市は2020年行政区域の境界にメッシュ中心点が含まれるものを抽出しています。別荘推定はOSM建物数と2020年人口からの近似で、実際の別荘戸数ではありません。</p>
+    <p class="note">北杜市は2020年行政区域の境界にメッシュ中心点が含まれるものを抽出しています。別荘推定はOSM建物数から明らかな非住宅系タグを除き、2020年世帯数を上回る候補建物を近似的に可視化しています。実際の別荘戸数ではありません。</p>
   </aside>
   <section class="map-wrap">
     <div id="map" role="img" aria-label="山梨県と北杜市の1km人口密度メッシュマップ"></div>
@@ -532,21 +585,25 @@ function densityChange(f) {
 function buildingProxy(f) {
   return f.properties.building_proxy || {
     total_buildings: 0,
+    candidate_buildings: 0,
     residential_tagged_buildings: 0,
+    non_residential_tagged_buildings: 0,
     unknown_tagged_buildings: 0,
     has_hokuto_buildings: false,
     people_per_building_2020: null,
     buildings_per_100_people_2020: 0,
+    buildings_per_household_2020: null,
+    surplus_buildings_vs_households_2020: 0,
+    raw_villa_score_2020: 0,
+    villa_score_2020: 0,
+    villa_confidence: "low",
     top_building_tags: [],
   };
 }
 
 function villaScore(f) {
   const proxy = buildingProxy(f);
-  const pop = featurePopulation(f, 2020);
-  if (proxy.total_buildings <= 0) return 0;
-  if (pop <= 0) return 999;
-  return proxy.total_buildings / pop * 100;
+  return proxy.villa_score_2020 || 0;
 }
 
 function renderControls() {
@@ -627,16 +684,19 @@ function renderStats(features) {
   }
 
   if (mode === "villa") {
-    const buildingMeshes = features.filter(f => buildingProxy(f).total_buildings > 0);
+    const buildingMeshes = features.filter(f => buildingProxy(f).candidate_buildings > 0);
     const totalBuildings = features.reduce((sum, f) => sum + buildingProxy(f).total_buildings, 0);
+    const candidateBuildings = features.reduce((sum, f) => sum + buildingProxy(f).candidate_buildings, 0);
+    const surplusBuildings = features.reduce((sum, f) => sum + buildingProxy(f).surplus_buildings_vs_households_2020, 0);
     const residentialTagged = features.reduce((sum, f) => sum + buildingProxy(f).residential_tagged_buildings, 0);
-    const pop = features.reduce((sum, f) => sum + featurePopulation(f, 2020), 0);
-    const peoplePerBuilding = totalBuildings > 0 ? pop / totalBuildings : 0;
+    const households = features.reduce((sum, f) => sum + featureHouseholds(f, 2020), 0);
     document.getElementById("stats").innerHTML = [
-      ["建物ありメッシュ", buildingMeshes.length.toLocaleString("ja-JP")],
+      ["候補メッシュ", buildingMeshes.length.toLocaleString("ja-JP")],
       ["OSM建物数", totalBuildings.toLocaleString("ja-JP")],
+      ["候補建物数", candidateBuildings.toLocaleString("ja-JP")],
       ["住宅系タグ数", residentialTagged.toLocaleString("ja-JP")],
-      ["人口/建物", peoplePerBuilding.toFixed(2).toLocaleString("ja-JP") + " 人/棟"],
+      ["世帯超過建物", surplusBuildings.toLocaleString("ja-JP") + " 棟"],
+      ["2020年世帯数", households.toLocaleString("ja-JP") + " 世帯"],
     ].map(([k, v]) => '<div class="stat"><span>' + k + '</span><strong>' + v + '</strong></div>').join("");
     return;
   }
@@ -665,11 +725,11 @@ function renderLegend() {
       ? ["-100以下", "-100 - -50", "-50 - -10", "-10 - +10", "+10 - +50", "+50 - +100", "+100以上"]
     : mode === "householdChange"
       ? ["-50以下", "-50 - -25", "-25 - -10", "-10 - +10", "+10 - +25", "+25 - +50", "+50以上"]
-      : ["建物なし", "0-10", "10-25", "25-50", "50-100", "100+"];
+      : ["超過なし", "0-10", "10-25", "25-50", "50-100", "100+"];
   const palette = mode === "density" ? densityPalette : mode === "households" ? householdPalette : mode === "change" || mode === "householdChange" ? changePalette : villaPalette;
   document.querySelector(".control .label + #legend");
   document.getElementById("legend").previousElementSibling.textContent =
-    mode === "density" ? "人口密度（人/km²）" : mode === "households" ? "世帯数（世帯/メッシュ）" : mode === "change" ? "人口増減（人）" : mode === "householdChange" ? "世帯増減（世帯）" : "建物数/100人";
+    mode === "density" ? "人口密度（人/km²）" : mode === "households" ? "世帯数（世帯/メッシュ）" : mode === "change" ? "人口増減（人）" : mode === "householdChange" ? "世帯増減（世帯）" : "世帯超過建物（%）";
   document.getElementById("legend").innerHTML = labels.map((label, i) => '<div class="swatch"><span class="chip" style="background:' + palette[i] + '"></span><span>' + label + '</span></div>').join("");
 }
 
@@ -678,18 +738,26 @@ function popupHtml(f) {
   if (mode === "villa") {
     const proxy = buildingProxy(f);
     const pop = featurePopulation(f, 2020);
+    const households = featureHouseholds(f, 2020);
     const score = villaScore(f);
-    const peoplePerBuilding = proxy.people_per_building_2020 === null ? "人口0または建物なし" : Number(proxy.people_per_building_2020).toLocaleString("ja-JP") + " 人/棟";
+    const buildingsPerHousehold = proxy.buildings_per_household_2020 === null ? "世帯なし" : Number(proxy.buildings_per_household_2020).toLocaleString("ja-JP") + " 棟/世帯";
+    const confidence = proxy.villa_confidence === "high" ? "高" : proxy.villa_confidence === "medium" ? "中" : "低";
     const tagSummary = proxy.top_building_tags.length
       ? proxy.top_building_tags.map(([tag, count]) => tag + ":" + count).join(", ")
       : "なし";
     return '<div class="mesh-popup"><b>メッシュ ' + p.mesh_code + '</b><br>' +
       (p.is_hokuto ? '北杜市内' : '山梨県内') + '<br>' +
       '2020年人口: ' + Math.round(pop).toLocaleString("ja-JP") + ' 人<br>' +
+      '2020年世帯数: ' + Math.round(households).toLocaleString("ja-JP") + ' 世帯<br>' +
       'OSM建物数: ' + proxy.total_buildings.toLocaleString("ja-JP") + ' 棟<br>' +
+      '候補建物数: ' + proxy.candidate_buildings.toLocaleString("ja-JP") + ' 棟<br>' +
+      '非住宅系除外: ' + proxy.non_residential_tagged_buildings.toLocaleString("ja-JP") + ' 棟<br>' +
       '住宅系タグ数: ' + proxy.residential_tagged_buildings.toLocaleString("ja-JP") + ' 棟<br>' +
-      '人口/建物: ' + peoplePerBuilding + '<br>' +
-      '建物数/100人: ' + (score >= 999 ? '人口0で建物あり' : score.toFixed(1).toLocaleString("ja-JP")) + '<br>' +
+      '候補建物/世帯: ' + buildingsPerHousehold + '<br>' +
+      '世帯超過建物: ' + proxy.surplus_buildings_vs_households_2020.toLocaleString("ja-JP") + ' 棟<br>' +
+      '超過率: ' + Number(proxy.raw_villa_score_2020 || 0).toFixed(1).toLocaleString("ja-JP") + '%<br>' +
+      '推定スコア: ' + score.toFixed(1).toLocaleString("ja-JP") + '%（信頼度補正）<br>' +
+      '信頼度: ' + confidence + '<br>' +
       '主なbuildingタグ: ' + tagSummary + '</div>';
   }
 
@@ -766,14 +834,13 @@ function labelText(f) {
     return signed(Math.round(householdChange(f)), "");
   }
   const score = villaScore(f);
-  if (score >= 999) return "∞";
   return score >= 100 ? Math.round(score).toLocaleString("ja-JP") : score.toFixed(1);
 }
 
 function styleForFeature(f) {
   const value = mode === "density" ? featureDensity(f, currentYear) : mode === "households" ? featureHouseholds(f, currentYear) : mode === "change" ? populationChange(f) : mode === "householdChange" ? householdChange(f) : villaScore(f);
   const dim = !inCurrentScope(f);
-  const noVillaData = mode === "villa" && buildingProxy(f).total_buildings <= 0;
+  const noVillaData = mode === "villa" && buildingProxy(f).candidate_buildings <= 0;
   return {
     color: "rgba(32,45,60,.45)",
     weight: dim || noVillaData ? 0.2 : 0.6,
