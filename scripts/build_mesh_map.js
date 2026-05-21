@@ -513,6 +513,10 @@ function featureDensity(f, year) {
   return f.properties.density_per_km2[year] || 0;
 }
 
+function formatNullable(value, formatter) {
+  return value === null || value === undefined ? "--" : formatter(value);
+}
+
 function populationChange(f) {
   return featurePopulation(f, changePair.to) - featurePopulation(f, changePair.from);
 }
@@ -726,12 +730,12 @@ function popupHtml(f) {
       '2010→2020世帯増減: ' + signed(p.household_change_2010_2020 || 0, ' 世帯') + '</div>';
   }
 
-  const pop = p.population[currentYear] ?? 0;
-  const den = p.density_per_km2[currentYear] ?? 0;
+  const rawPop = p.population[currentYear];
+  const rawDensity = p.density_per_km2[currentYear];
   return '<div class="mesh-popup"><b>メッシュ ' + p.mesh_code + '</b><br>' +
     (p.is_hokuto ? '北杜市内' : '山梨県内') + '<br>' +
-    currentYear + '年人口: ' + Math.round(pop).toLocaleString("ja-JP") + ' 人<br>' +
-    '人口密度: ' + Number(den).toLocaleString("ja-JP") + ' 人/km²<br>' +
+    currentYear + '年人口: ' + formatNullable(rawPop, value => Math.round(value).toLocaleString("ja-JP") + ' 人') + '<br>' +
+    '人口密度: ' + formatNullable(rawDensity, value => Number(value).toLocaleString("ja-JP") + ' 人/km²') + '<br>' +
     '2010→2020増減: ' + (p.change_2010_2020 >= 0 ? '+' : '') + p.change_2010_2020.toLocaleString("ja-JP") + ' 人</div>';
 }
 
@@ -747,6 +751,8 @@ function meshCenterLatLng(f) {
 
 function labelText(f) {
   if (mode === "density") {
+    const rawValue = f.properties.density_per_km2[currentYear];
+    if (rawValue === null || rawValue === undefined) return "--";
     const value = featureDensity(f, currentYear);
     return value >= 100 ? Math.round(value).toLocaleString("ja-JP") : value.toFixed(1);
   }
